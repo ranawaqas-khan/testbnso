@@ -2,18 +2,20 @@
  * POST /api/scrape
  *
  * Accepts a scrape request from the React SaaS, enqueues it, and immediately
- * returns a jobId that the SaaS can use to poll for results.
+ * returns a jobId that the SaaS can poll for results.
  *
  * Request body:
  * {
- *   "queries": ["coffee shops in NYC", "coffee shops in LA"],   // required
- *   "strategy": "Fast"                                           // optional: Fast | Fastest | Detailed
+ *   "queries":     ["coffee shops in NYC", "coffee shops in LA"],  // required
+ *   "max_results": 120,   // optional, per query (max 120, Google Maps limit)
+ *   "lang":        "en",  // optional, language code
+ *   "zoom":        15     // optional, 15–18 (higher = more results, slower)
  * }
  *
- * Response:
+ * Response 202:
  * {
- *   "jobId": "uuid",
- *   "status": "pending",
+ *   "jobId":   "uuid",
+ *   "status":  "pending",
  *   "pollUrl": "/api/results/<jobId>"
  * }
  */
@@ -24,18 +26,15 @@ const logger = require('../logger');
 
 const router = Router();
 
-// Allowed strategies from Google Maps Extractor API
-const VALID_STRATEGIES = ['Fast', 'Fastest', 'Detailed'];
-
 router.post('/', async (req, res) => {
   try {
-    const { queries, strategy = 'Fast' } = req.body;
+    const { queries, max_results = 120, lang, zoom } = req.body;
 
     // --- Validation ---
     if (!queries || !Array.isArray(queries) || queries.length === 0) {
       return res.status(400).json({
         error: 'queries must be a non-empty array of strings',
-        example: { queries: ['coffee shops in NYC'], strategy: 'Fast' },
+        example: { queries: ['coffee shops in NYC'], max_results: 120 },
       });
     }
 
@@ -44,21 +43,28 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'All queries must be non-empty strings' });
     }
 
-    if (!VALID_STRATEGIES.includes(strategy)) {
-      return res.status(400).json({
-        error: `strategy must be one of: ${VALID_STRATEGIES.join(', ')}`,
-      });
-    }
-
     if (queries.length > 50) {
       return res.status(400).json({ error: 'Max 50 queries per request' });
     }
 
+    if (max_results < 1 || max_results > 120) {
+      return res.status(400).json({ error: 'max_results must be between 1 and 120' });
+    }
+
+    if (zoom !== undefined && (zoom < 15 || zoom > 18)) {
+      return res.status(400).json({ error: 'zoom must be between 15 and 18' });
+    }
+
+    // --- Build options ---
+    const options = { max_results };
+    if (lang) options.lang = lang;
+    if (zoom) options.zoom = zoom;
+
     // --- Enqueue ---
     const cleanQueries = queries.map((q) => q.trim());
-    const jobId = await enqueue({ queries: cleanQueries, strategy });
+    const jobId = await enqueue({ queries: cleanQueries, options });
 
-    logger.info('Scrape job accepted', { jobId, queryCount: cleanQueries.length });
+    logger.info('Scrape job accepted', { jobId, queryCount: cleanQueries.length, options });
 
     return res.status(202).json({
       jobId,

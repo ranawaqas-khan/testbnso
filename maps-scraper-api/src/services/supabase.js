@@ -1,8 +1,8 @@
 /**
  * Supabase service
  *
- * Handles all DB operations.
- * Place ID is the unique identifier — we upsert to avoid duplicates.
+ * All DB operations. `kgmid` is the unique place identifier from Google Maps
+ * (place_id can be absent — never use it as a unique key).
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -10,25 +10,19 @@ const logger = require('../logger');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY, // service-role key for server-side ops
+  process.env.SUPABASE_SERVICE_ROLE_KEY, // service-role key bypasses RLS
   { auth: { persistSession: false } }
 );
 
 /* ------------------------------------------------------------------ */
-/*  Jobs (in-memory tracking per worker — Supabase table for shared)   */
+/*  Jobs                                                                */
 /* ------------------------------------------------------------------ */
 
-/**
- * Create a job record in Supabase.
- * @param {string} jobId  uuid
- * @param {string[]} queries
- * @param {string} strategy
- */
-async function createJob(jobId, queries, strategy) {
+async function createJob(jobId, queries, options) {
   const { error } = await supabase.from('scrape_jobs').insert({
     id: jobId,
     queries,
-    strategy,
+    options,
     status: 'pending',
     results_count: 0,
   });
@@ -37,12 +31,9 @@ async function createJob(jobId, queries, strategy) {
 }
 
 async function updateJobStatus(jobId, status, resultsCount = null, errorMessage = null) {
-  const update = {
-    status,
-    updated_at: new Date().toISOString(),
-  };
+  const update = { status, updated_at: new Date().toISOString() };
   if (resultsCount !== null) update.results_count = resultsCount;
-  if (errorMessage) update.error_message = errorMessage;
+  if (errorMessage)          update.error_message = errorMessage;
   if (status === 'completed' || status === 'failed') {
     update.completed_at = new Date().toISOString();
   }
@@ -62,91 +53,101 @@ async function getJob(jobId) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Places — upsert with Place ID deduplication                        */
+/*  Places — upsert deduplicated on kgmid                             */
 /* ------------------------------------------------------------------ */
 
 /**
  * Upsert an array of normalised places.
- * place_id is the unique key — existing rows are updated, new ones inserted.
+ * kgmid is the unique key — existing rows are updated, new ones inserted.
  *
  * @param {Object[]} places  - normalised place objects from mapsExtractor
  * @param {string}   jobId
- * @returns {Promise<{ inserted: number, updated: number }>}
  */
 async function upsertPlaces(places, jobId) {
-  if (!places.length) return { inserted: 0, updated: 0 };
+  if (!places.length) return;
 
-  // Filter out places without a place_id — they can't be deduplicated
-  const valid = places.filter((p) => p.place_id);
+  // Must have kgmid to be deduplicated
+  const valid = places.filter((p) => p.kgmid);
   if (valid.length !== places.length) {
-    logger.warn('Some places missing place_id — skipped', {
+    logger.warn('Some places missing kgmid — skipped', {
       skipped: places.length - valid.length,
     });
   }
+  if (!valid.length) return;
 
   const rows = valid.map((p) => ({
-    place_id: p.place_id,
-    name: p.name,
-    address: p.address,
-    phone: p.phone,
-    website: p.website,
-    rating: p.rating,
-    reviews_count: p.reviews_count,
-    category: p.category,
-    latitude: p.latitude,
-    longitude: p.longitude,
-    is_spending_on_ads: p.is_spending_on_ads,
-    status: p.status,
-    opening_hours: p.opening_hours,
-    photos_count: p.photos_count,
-    raw_data: p.raw_data,
-    last_scraped_at: new Date().toISOString(),
+    kgmid:                 p.kgmid,
+    place_id:              p.place_id,
+    cid:                   p.cid,
+    data_id:               p.data_id,
+    name:                  p.name,
+    description:           p.description,
+    link:                  p.link,
+    main_category:         p.main_category,
+    categories:            p.categories,
+    address:               p.address,
+    detailed_address:      p.detailed_address,
+    phone:                 p.phone,
+    website:               p.website,
+    rating:                p.rating,
+    reviews_count:         p.reviews_count,
+    reviews_link:          p.reviews_link,
+    latitude:              p.latitude,
+    longitude:             p.longitude,
+    plus_code:             p.plus_code,
+    time_zone:             p.time_zone,
+    status:                p.status,
+    is_temporarily_closed: p.is_temporarily_closed,
+    is_permanently_closed: p.is_permanently_closed,
+    is_spending_on_ads:    p.is_spending_on_ads,
+    can_claim:             p.can_claim,
+    workday_timing:        p.workday_timing,
+    closed_on:             p.closed_on,
+    hours:                 p.hours,
+    linkedin:              p.linkedin,
+    twitter:               p.twitter,
+    facebook:              p.facebook,
+    youtube:               p.youtube,
+    instagram:             p.instagram,
+    featured_image:        p.featured_image,
+    image_count:           p.image_count,
+    owner:                 p.owner,
+    price_range:           p.price_range,
+    about:                 p.about,
+    raw_data:              p.raw_data,
+    last_scraped_at:       new Date().toISOString(),
   }));
 
-  // Upsert in chunks of 500 to stay within Supabase limits
+  // Upsert in chunks of 500 to stay within Supabase payload limits
   const CHUNK = 500;
-  let inserted = 0;
-  let updated = 0;
-
   for (let i = 0; i < rows.length; i += CHUNK) {
     const chunk = rows.slice(i, i + CHUNK);
-
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('places')
-      .upsert(chunk, {
-        onConflict: 'place_id',
-        ignoreDuplicates: false, // update existing rows
-      })
-      .select('place_id');
+      .upsert(chunk, { onConflict: 'kgmid', ignoreDuplicates: false });
 
-    if (error) {
-      logger.error('Upsert error', { error: error.message });
-      throw new Error(`Supabase upsert failed: ${error.message}`);
-    }
-
-    inserted += data?.length || chunk.length;
+    if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
   }
 
-  // Link job → places in junction table
-  await linkJobToPlaces(jobId, valid.map((p) => p.place_id));
+  // Link job ↔ places
+  await linkJobToPlaces(jobId, valid.map((p) => p.kgmid));
 
   logger.info('Upserted places', { jobId, count: valid.length });
-  return { inserted, updated };
 }
 
-async function linkJobToPlaces(jobId, placeIds) {
-  const rows = placeIds.map((pid) => ({ job_id: jobId, place_id: pid }));
+async function linkJobToPlaces(jobId, kgmids) {
+  const rows = kgmids.map((k) => ({ job_id: jobId, kgmid: k }));
   const CHUNK = 500;
   for (let i = 0; i < rows.length; i += CHUNK) {
     const { error } = await supabase
       .from('job_places')
-      .upsert(rows.slice(i, i + CHUNK), { onConflict: 'job_id,place_id', ignoreDuplicates: true });
+      .upsert(rows.slice(i, i + CHUNK), { onConflict: 'job_id,kgmid', ignoreDuplicates: true });
     if (error) logger.warn('job_places link error', { error: error.message });
   }
 }
 
 /**
- * Get results for a job with optional pagination.
+ * Get paginated results for a job.
  */
 async function getJobResults(jobId, { page = 1, limit = 100 } = {}) {
   const offset = (page - 1) * limit;
@@ -160,8 +161,8 @@ async function getJobResults(jobId, { page = 1, limit = 100 } = {}) {
   if (error) throw new Error(`Failed to fetch results: ${error.message}`);
 
   return {
-    results: data?.map((r) => r.places) || [],
-    total: count || 0,
+    results: data?.map((r) => r.places) ?? [],
+    total:   count ?? 0,
     page,
     limit,
   };
